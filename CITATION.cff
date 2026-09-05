@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+title: "Learning Beyond Sequence: A Multi-Representation and Contrastive Learning Framework for Antifungal Peptide Prediction"
+message: "If you use TLH-AFP in your research, please cite this work."
+type: software
+
+authors:
+  - family-names: Mahmoudian
+    given-names: Fatemeh
+    affiliation: "Department of Computer Engineering, Artificial Intelligence and Robotics, University of Qom, Qom, Iran"
+    email: "mahmodian.f@gmail.com"
+
+  - family-names: Lakizadeh
+    given-names: Amir
+    affiliation: "Department of Computer Engineering, University of Qom, Qom, Iran"
+    email: "lakizadeh@qom.ac.ir"
+    orcid: ""
+
+repository-code: "https://github.com/mahmodianf-bit/TLH-AFP"
+
+abstract: "TLH-AFP is a multi-representation and supervised contrastive learning framework for antifungal peptide prediction."
+
+keywords:
+  - antifungal peptides
+  - AFP prediction
+  - protein language models
+  - multi-representation learning
+  - cross-attention
+  - feature selection
+  - supervised contrastive learning
