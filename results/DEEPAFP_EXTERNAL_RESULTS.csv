@@ -1,0 +1,2 @@
+Model,Accuracy,Precision,Recall,F1_Score,AUROC,PR_AUC,MCC
+TLH-AFP,93.46,93.17,93.81,93.49,0.9830,0.9851,0.8692
