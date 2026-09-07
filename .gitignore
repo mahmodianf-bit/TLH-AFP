@@ -2,50 +2,34 @@
 __pycache__/
 *.py[cod]
 *.pyo
-*.pyd
-
-# Jupyter
-.ipynb_checkpoints/
-
-# Virtual environments
 .venv/
 venv/
 env/
-ENV/
 
 # IDE
 .vscode/
 .idea/
 
-# OS
-.DS_Store
-Thumbs.db
+# Jupyter
+.ipynb_checkpoints/
 
-# Logs
-*.log
-
-# Temporary files
-*.tmp
-*.temp
-
-# Python distributions
-build/
-dist/
-*.egg-info/
+# Large feature files
+*.npy
+*.npz
 
 # Model checkpoints
 *.pt
 *.pth
 *.ckpt
 
-# Large binary data
-*.npy
-*.npz
+# Serialized model objects
 *.pkl
 
-# Experiment outputs
-results/*
-!results/README.md
+# Local experiment outputs
+runs/
+logs/
+wandb/
 
-# Local configuration
-.env
+# OS files
+.DS_Store
+Thumbs.db
