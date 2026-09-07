@@ -1,0 +1,6 @@
+Model,Accuracy,Precision,Specificity,F1_Score,AUROC,PR_AUC
+Agrawal et al. (2018),86.25,,85.91,,,
+Deep-AntiFP (2019),89.08,,87.79,,,
+iAFPs-Mv-BiTCN (2024),94.11,,94.27,,,
+AI4AFP (Ensemble Seven Models, 2026),94.00,95.00,95.00,,,
+TLH-AFP,94.33,96.74,96.91,94.18,0.9821,0.9805
