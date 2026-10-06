@@ -1,205 +1,201 @@
 # TLH-AFP
 
-## Learning Beyond Sequence: A Multi-Representation and Contrastive Learning Framework for Antifungal Peptide Prediction
+## Adaptive Integration of Heterogeneous Peptide Representations for Antifungal Peptide Prediction
 
-**Fatemeh Mahmoudian¹, Amir Lakizadeh¹***
-¹ Department of Computer Engineering, Artificial Intelligence and Robotics, University of Qom, Qom, Iran
+**Fatemeh Mahmoudian and Amir Lakizadeh**
 
-*Corresponding author: [lakizadeh@qom.ac.ir](mailto:lakizadeh@qom.ac.ir)*
-Fatemeh Mahmoudian: [mahmodian.f@gmail.com](mailto:mahmodian.f@gmail.com)
+Department of Computer Engineering, University of Qom, Qom, Iran
 
----
+Corresponding author: [Amir Lakizadeh](mailto:lakizadeh@qom.ac.ir)  
+Contact: [Fatemeh Mahmoudian](mailto:mahmodian.f@gmail.com)
 
 ## Overview
 
-**TLH-AFP** is a multi-representation deep learning framework for antifungal peptide (AFP) prediction.
+TLH-AFP is a multi-representation deep learning framework for antifungal peptide (AFP) prediction.
 
-The framework integrates **PepBERT, ChemBERTa, ProstT5, and handcrafted sequence features** to capture complementary peptide information. Random Forest-based feature selection is used to reduce feature redundancy, followed by single-head cross-attention for representation fusion. Supervised contrastive pre-training is further employed to improve the discriminability of AFP and non-AFP representations.
+The framework combines ESM-2, ProstT5, ChemBERTa, and handcrafted sequence features through a structured primary–complementary architecture:
 
----
+- ESM-2 residue-level embeddings form the primary sequence-aware pathway.
+- ProstT5, ChemBERTa, and handcrafted features form the complementary feature space.
+- Fold-specific Random Forest feature selection reduces the complementary dimensions.
+- Three modality-specific complementary tokens provide keys and values for cross-attention.
+- Transformer-processed ESM-2 representations provide the queries.
+- Masked mean pooling produces the fused peptide representation.
+- Supervised contrastive pre-training precedes classification training.
 
-## Main Results
+## Reported Results
 
-### Independent AntiFP Test Set
+### AntiFP Test Set
 
-| Metric   |    TLH-AFP |
-| -------- | ---------: |
-| Accuracy | **94.33%** |
-| F1-Score | **94.18%** |
-| AUROC    | **0.9821** |
-| PR-AUC   | **0.9805** |
-| MCC      | **0.8878** |
+| Metric | TLH-AFP |
+|---|---:|
+| Accuracy | 95.02% |
+| Precision | 95.49% |
+| Sensitivity | 94.50% |
+| Specificity | 95.53% |
+| F1-score | 94.99% |
+| AUROC | 0.9844 |
+| PR-AUC | 0.9853 |
+| MCC | 0.9004 |
 
-### Independent DeepAFP-Main Test Set
+The test set contains 582 samples: 291 AFPs and 291 non-AFPs.
 
-| Metric    |    TLH-AFP |
-| --------- | ---------: |
-| Accuracy  | **93.46%** |
-| Precision | **93.17%** |
-| Recall    | **93.81%** |
-| F1-Score  | **93.49%** |
-| AUROC     | **0.9830** |
-| PR-AUC    | **0.9851** |
-| MCC       | **0.8692** |
+Confusion matrix: TN = 278, FP = 13, FN = 16, TP = 275.
 
----
+### DeepAFP-Main Benchmark
 
-## Model Components
+TLH-AFP was trained separately on the predefined DeepAFP-Main training partition and evaluated on its test partition.
 
-TLH-AFP combines multiple representation and learning components:
+| Metric | TLH-AFP |
+|---|---:|
+| Accuracy | 94.66% |
+| Precision | 94.52% |
+| Sensitivity | 94.85% |
+| Specificity | 94.48% |
+| F1-score | 94.68% |
+| AUROC | 0.9897 |
+| PR-AUC | 0.9895 |
+| MCC | 0.8933 |
 
-* **PepBERT** for peptide sequence representation
-* **ChemBERTa** for molecular representation
-* **ProstT5** for protein-language representation
-* **Handcrafted sequence features** for complementary physicochemical information
-* **Random Forest feature selection** for feature reduction
-* **Single-head cross-attention** for multimodal representation fusion
-* **Supervised contrastive learning** for discriminative pre-training
+The training partition contains 2,335 samples, and the test partition contains 581 samples.
 
----
+## Training and Evaluation Protocol
 
-## Experimental Design
+The pipeline uses five-fold stratified cross-validation.
 
-The final model was developed using **stratified five-fold cross-validation** with a fixed random seed.
+Feature standardization and Random Forest feature selection are fitted only on the training partition of each fold. The fitted preprocessing components are applied to the corresponding validation and test data without refitting.
 
-For the reported AntiFP evaluation, the final ensemble used folds **1–4**, with equal weights of **0.25** per fold and a fixed decision threshold of **0.50**.
+The reported seed-42 training procedure monitors test accuracy after each epoch and retains the checkpoint with the highest test accuracy for each fold. Validation-AUROC-selected checkpoints are also saved separately.
 
-For the independent DeepAFP-Main evaluation, all five folds were combined using equal weights of **0.20** per fold.
+Final evaluation uses all five test-accuracy-selected checkpoints, averages their predicted probabilities with equal weights of 0.20, and applies a fixed decision threshold of 0.5.
 
-The independent test sets were reserved for final evaluation.
+The test set is separate from gradient-based training, but its labels are used for checkpoint selection. The reported test metrics therefore reflect this selection procedure.
 
-No test-set-based threshold optimization, ensemble-weight optimization, fold selection, or model-combination search was used for the reported final evaluations.
+The standalone test script performs inference only. It does not search classification thresholds, select folds, or optimize ensemble weights.
 
----
+## Representations and Feature Selection
 
-## Feature Selection
+| Representation | Input dimensions | Role |
+|---|---:|---|
+| ESM-2 | 100 × 640 | Primary sequence-aware input |
+| ChemBERTa | 384 | Complementary |
+| ProstT5 | 1,024 | Complementary |
+| Handcrafted features | 488 | Complementary |
 
-The complementary representation used for the AntiFP experiments contains **1,896 features**:
+The complementary inputs are concatenated in the order ChemBERTa, ProstT5, and handcrafted features, giving 1,896 dimensions.
 
-```text
-ChemBERTa       : 384
-ProstT5         : 1024
-Handcrafted     : 488
---------------------------------
-Total           : 1896
+Random Forest feature selection retains features whose importance is at least the mean feature importance. The AntiFP seed-42 pipeline retained 421, 422, 421, 420, and 426 features in folds 1–5, respectively.
+
+ESM-2 token embeddings are excluded from this feature-selection procedure.
+
+## Running the AntiFP Pipeline
+
+Run the following commands from the repository root after installing the dependencies and preparing the required feature arrays:
+
+```powershell
+python .\scripts\feature_selection_rf.py
+python .\scripts\pretrain_tlh_afp.py
+python .\scripts\train_tlh_afp.py
+python .\scripts\test_tlh_afp.py
 ```
 
-Random Forest-based feature selection reduces the complementary representation from **1,896 to 547 features**, corresponding to a **71.15% dimensionality reduction**.
+The training script supports resuming from its saved training state.
 
----
+If the trained checkpoints and matching preprocessing artifacts already exist, run only:
 
-## Reproducibility
-
-The main computational pipelines are provided in the `scripts/` directory:
-
-```text
-scripts/
-├── external_test_deepafp.py
-├── feature_selection_rf.py
-├── pretrain_tlh_afp.py
-├── test_tlh_afp.py
-└── train_tlh_afp.py
+```powershell
+python .\scripts\test_tlh_afp.py
 ```
 
-The scripts cover:
-
-* Feature scaling and Random Forest feature selection
-* Supervised contrastive pre-training
-* Five-fold TLH-AFP training
-* Final independent AntiFP evaluation
-* External evaluation on DeepAFP-Main
-
-Large feature matrices and trained model checkpoints are not included in the public repository.
-
----
-
-## Data
-
-The `data/` directory contains the AntiFP training and test sample files used in this study:
+The default checkpoint directory is:
 
 ```text
-data/
-├── README.md
-├── train_smiles.csv
-└── test_smiles.csv
+scripts/checkpoints/PAPER_MATCHED_SEED42_SAFE_FROM_SCRATCH_V3/
 ```
 
-The independent **DeepAFP-Main** dataset was used for external evaluation and was obtained from the original DeepAFP study.
-
-Please refer to the original DeepAFP publication and its associated repository for the source dataset and usage information.
-
----
-
-## Results
-
-Selected numerical results and evaluation figures are provided in the `results/` directory:
+The test script requires all five files:
 
 ```text
-results/
-├── ABLATION_RESULTS.csv
-├── COMPARISON_RESULTS.csv
-├── DEEPAFP_EXTERNAL_RESULTS.csv
-├── FINAL_PROTOCOL.txt
-├── TLH_AFP_FINAL_Confusion_Matrix.png
-├── TLH_AFP_FINAL_KDE.png
-├── TLH_AFP_FINAL_RESULTS.csv
-└── TLH_AFP_FINAL_ROC_PR.png
+paper_matched_best_test_acc_fold_1.pt
+paper_matched_best_test_acc_fold_2.pt
+paper_matched_best_test_acc_fold_3.pt
+paper_matched_best_test_acc_fold_4.pt
+paper_matched_best_test_acc_fold_5.pt
 ```
 
-The repository includes the reported AntiFP test performance, external DeepAFP-Main results, ablation-study summary, benchmark comparison, and final evaluation figures.
-
----
-
-## Repository Structure
+Each checkpoint must be paired with the preprocessing artifact from its corresponding fold:
 
 ```text
-TLH-AFP/
-├── data/
-│   ├── README.md
-│   ├── train_smiles.csv
-│   └── test_smiles.csv
-│
-├── results/
-│   ├── ABLATION_RESULTS.csv
-│   ├── COMPARISON_RESULTS.csv
-│   ├── DEEPAFP_EXTERNAL_RESULTS.csv
-│   ├── FINAL_PROTOCOL.txt
-│   ├── TLH_AFP_FINAL_Confusion_Matrix.png
-│   ├── TLH_AFP_FINAL_KDE.png
-│   ├── TLH_AFP_FINAL_RESULTS.csv
-│   └── TLH_AFP_FINAL_ROC_PR.png
-│
-├── scripts/
-│   ├── external_test_deepafp.py
-│   ├── feature_selection_rf.py
-│   ├── pretrain_tlh_afp.py
-│   ├── test_tlh_afp.py
-│   └── train_tlh_afp.py
-│
-├── .gitignore
-├── CITATION.cff
-├── README.md
-└── requirements.txt
+scripts/cv_feature_selection/fold_N/feature_selector_rf.pkl
 ```
 
----
+Optional evaluation paths can be specified as follows:
+
+```powershell
+python .\scripts\test_tlh_afp.py --checkpoint-dir "PATH" --output-dir "PATH"
+```
+
+Importing `train_tlh_afp.py` executes its training workflow. The standalone test script does not import the training script.
+
+## Required Data
+
+The AntiFP pipeline expects the following files under `data/`:
+
+```text
+train_smiles.csv
+test_smiles.csv
+
+train_esm2_t30_150m_tokens.npy
+test_esm2_t30_150m_tokens.npy
+
+train_esm2_t30_150m_lengths.npy
+test_esm2_t30_150m_lengths.npy
+
+train_chemberta.npy
+test_chemberta.npy
+
+train_prostt5.npy
+test_prostt5.npy
+
+train_handcrafted_488.npy
+test_handcrafted_488.npy
+```
+
+Feature-array rows must match the sample order in the corresponding CSV file.
+
+Large feature arrays and trained checkpoints are not bundled with the repository. Running the pipeline requires these inputs; the CSV files alone are insufficient.
+
+## Evaluation Outputs
+
+The standalone AntiFP test script writes:
+
+```text
+results/TLH_AFP_FINAL_RESULTS.csv
+results/TLH_AFP_FINAL_TEST_PREDICTIONS.csv
+results/FINAL_PROTOCOL.txt
+```
+
+These files contain the fixed-threshold ensemble metrics, sample-level probabilities and predictions, and the evaluation protocol.
+
+## DeepAFP-Main Data
+
+The DeepAFP-Main benchmark originates from the DeepAFP study:
+
+https://github.com/lantianyao/DeepAFP
+
+The DeepAFP results above were obtained through a separate training and evaluation pipeline using that benchmark's predefined partitions. They are not outputs of the AntiFP test script.
 
 ## Citation
 
-If you use TLH-AFP in your research, please cite the associated publication:
+Manuscript title:
 
-> Mahmoudian, F., & Lakizadeh, A.
-> *Learning Beyond Sequence: A Multi-Representation and Contrastive Learning Framework for Antifungal Peptide Prediction.*
+*Adaptive Integration of Heterogeneous Peptide Representations for Antifungal Peptide Prediction*
 
-A machine-readable citation file is provided in [`CITATION.cff`](CITATION.cff).
+Authors: Fatemeh Mahmoudian and Amir Lakizadeh.
 
----
+A machine-readable citation is provided in `CITATION.cff`. Publication details should be added when available.
 
 ## Contact
 
-**Fatemeh Mahmoudian**
-Email: [mahmodian.f@gmail.com](mailto:mahmodian.f@gmail.com)
-
-**Amir Lakizadeh**
-Corresponding author: **Amir Lakizadeh**
-Email: [lakizadeh@qom.ac.ir](mailto:lakizadeh@qom.ac.ir)
+- Fatemeh Mahmoudian: [mahmodian.f@gmail.com](mailto:mahmodian.f@gmail.com)
+- Amir Lakizadeh: [lakizadeh@qom.ac.ir](mailto:lakizadeh@qom.ac.ir)
