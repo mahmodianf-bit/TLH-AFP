@@ -1,0 +1,2281 @@
+import os
+import pickle
+import numpy as np
+import pandas as pd
+
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_selection import SelectFromModel
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import StratifiedKFold
+
+
+# ============================================================
+# 1. PROJECT PATHS
+# ============================================================
+
+PROJECT_ROOT = os.path.dirname(
+    os.path.dirname(
+        os.path.abspath(__file__)
+    )
+)
+
+DATA_DIR = os.path.join(
+    PROJECT_ROOT,
+    "data"
+)
+
+SCRIPTS_DIR = os.path.join(
+    PROJECT_ROOT,
+    "scripts"
+)
+
+CV_OUTPUT_DIR = os.path.join(
+    SCRIPTS_DIR,
+    "cv_feature_selection"
+)
+
+os.makedirs(
+    CV_OUTPUT_DIR,
+    exist_ok=True
+)
+
+
+# ============================================================
+# 2. INPUT FILES
+# ============================================================
+
+TRAIN_SMILES = os.path.join(
+    DATA_DIR,
+    "train_smiles.csv"
+)
+
+TRAIN_CHEMBERTA = os.path.join(
+    DATA_DIR,
+    "train_chemberta.npy"
+)
+
+TRAIN_PROSTT5 = os.path.join(
+    DATA_DIR,
+    "train_prostt5.npy"
+)
+
+TRAIN_HANDCRAFTED = os.path.join(
+    DATA_DIR,
+    "train_handcrafted_488.npy"
+)
+
+# ESM-2 sequence-aware Query embeddings
+TRAIN_ESM2_TOKENS = os.path.join(
+    DATA_DIR,
+    "train_esm2_t30_150m_tokens.npy"
+)
+
+TRAIN_ESM2_LENGTHS = os.path.join(
+    DATA_DIR,
+    "train_esm2_t30_150m_lengths.npy"
+)
+
+
+# ============================================================
+# 3. EXPERIMENT SETTINGS
+# ============================================================
+
+N_SPLITS = 5
+
+SEED = 42
+
+RF_N_ESTIMATORS = 100
+
+RF_RANDOM_STATE = 42
+
+ESM2_MODEL_NAME = (
+    "facebook/esm2_t30_150M_UR50D"
+)
+
+
+# ============================================================
+# 4. HELPER FUNCTIONS
+# ============================================================
+
+def check_file_exists(
+    path,
+    name
+):
+    """
+    Check that a required file exists.
+    """
+
+    if not os.path.exists(path):
+
+        raise FileNotFoundError(
+            f"\n{name} not found:\n{path}"
+        )
+
+
+def load_array(
+    path,
+    name,
+    expected_ndim
+):
+    """
+    Load a NumPy array using memory mapping.
+
+    This keeps large ESM-2 arrays from being unnecessarily
+    copied into RAM during the initial validation stage.
+    """
+
+    check_file_exists(
+        path,
+        name
+    )
+
+    array = np.load(
+        path,
+        mmap_mode="r"
+    )
+
+    if array.ndim != expected_ndim:
+
+        raise ValueError(
+            f"{name} must be "
+            f"{expected_ndim}D, "
+            f"but got shape {array.shape}"
+        )
+
+    print(
+        f"{name:<30} shape = {array.shape}"
+    )
+
+    return array
+
+
+def check_finite_2d(
+    array,
+    name
+):
+    """
+    Check an entire 2D array for NaN / Inf.
+    """
+
+    if not np.isfinite(array).all():
+
+        raise ValueError(
+            f"{name} contains "
+            f"NaN or Inf values."
+        )
+
+
+def check_finite_3d_chunked(
+    array,
+    name,
+    chunk_size=64
+):
+    """
+    Check a large 3D array for NaN / Inf
+    without creating another huge array in memory.
+    """
+
+    n_samples = array.shape[0]
+
+    for start in range(
+        0,
+        n_samples,
+        chunk_size
+    ):
+
+        end = min(
+            start + chunk_size,
+            n_samples
+        )
+
+        chunk = np.asarray(
+            array[start:end]
+        )
+
+        if not np.isfinite(chunk).all():
+
+            raise ValueError(
+                f"{name} contains "
+                f"NaN or Inf values "
+                f"in samples "
+                f"{start}:{end}"
+            )
+
+
+def check_same_sample_count(
+    arrays
+):
+    """
+    Ensure that all representations have
+    exactly the same number of samples.
+    """
+
+    counts = {
+
+        name:
+            arr.shape[0]
+
+        for name, arr in arrays.items()
+    }
+
+    unique_counts = set(
+        counts.values()
+    )
+
+    if len(unique_counts) != 1:
+
+        raise ValueError(
+            "Number of samples is not consistent:\n"
+            +
+            "\n".join(
+                f"{name}: {count}"
+                for name, count in counts.items()
+            )
+        )
+
+    return next(
+        iter(unique_counts)
+    )
+
+
+def get_feature_ranges(
+    feature_dimensions
+):
+    """
+    Dynamically create feature ranges
+    from the actual loaded dimensions.
+
+    No feature dimension is hard-coded.
+    """
+
+    feature_ranges = {}
+
+    current_start = 0
+
+    for name, dimension in feature_dimensions.items():
+
+        current_end = (
+            current_start
+            +
+            dimension
+        )
+
+        feature_ranges[name] = (
+            current_start,
+            current_end
+        )
+
+        current_start = current_end
+
+    return feature_ranges
+
+
+def get_selected_feature_counts(
+    selected_mask,
+    feature_ranges
+):
+    """
+    Count selected features separately
+    for each representation.
+    """
+
+    counts = {}
+
+    for name, (
+        start,
+        end
+    ) in feature_ranges.items():
+
+        counts[name] = int(
+            np.sum(
+                selected_mask[start:end]
+            )
+        )
+
+    return counts
+
+
+def feature_index_to_representation(
+    feature_index,
+    feature_ranges
+):
+    """
+    Identify which representation owns a given
+    feature index.
+    """
+
+    for name, (
+        start,
+        end
+    ) in feature_ranges.items():
+
+        if (
+            start
+            <=
+            feature_index
+            <
+            end
+        ):
+
+            local_index = (
+                feature_index
+                -
+                start
+            )
+
+            return (
+                name,
+                local_index
+            )
+
+    return (
+        "Unknown",
+        feature_index
+    )
+
+
+# ============================================================
+# 5. HEADER
+# ============================================================
+
+print("=" * 80)
+
+print(
+    "RANDOM FOREST FEATURE SELECTION "
+    "- 5-FOLD STRATIFIED CROSS-VALIDATION"
+)
+
+print("=" * 80)
+
+print(
+    f"Project Root : {PROJECT_ROOT}"
+)
+
+print(
+    f"Data Dir     : {DATA_DIR}"
+)
+
+print(
+    f"Output Dir   : {CV_OUTPUT_DIR}"
+)
+
+print(
+    f"ESM-2 Model  : {ESM2_MODEL_NAME}"
+)
+
+
+# ============================================================
+# 6. CHECK REQUIRED FILES
+# ============================================================
+
+print(
+    "\n"
+    + "=" * 80
+)
+
+print(
+    "CHECKING REQUIRED FILES"
+)
+
+print(
+    "=" * 80
+)
+
+required_files = {
+
+    "Train CSV":
+        TRAIN_SMILES,
+
+    "Train ChemBERTa":
+        TRAIN_CHEMBERTA,
+
+    "Train ProstT5":
+        TRAIN_PROSTT5,
+
+    "Train Handcrafted":
+        TRAIN_HANDCRAFTED,
+
+    "Train ESM-2 tokens":
+        TRAIN_ESM2_TOKENS,
+
+    "Train ESM-2 lengths":
+        TRAIN_ESM2_LENGTHS
+}
+
+
+for name, path in required_files.items():
+
+    check_file_exists(
+        path,
+        name
+    )
+
+    print(
+        f"✅ {name:<25} "
+        f"{os.path.basename(path)}"
+    )
+
+
+# ============================================================
+# 7. LOAD TRAIN CSV / LABELS
+# ============================================================
+
+print(
+    "\n"
+    + "=" * 80
+)
+
+print(
+    "LOADING TRAIN CSV"
+)
+
+print(
+    "=" * 80
+)
+
+train_df = pd.read_csv(
+    TRAIN_SMILES
+)
+
+
+if "label" not in train_df.columns:
+
+    raise ValueError(
+        "Column 'label' was not found "
+        "in train_smiles.csv"
+    )
+
+
+if "sequence" not in train_df.columns:
+
+    raise ValueError(
+        "Column 'sequence' was not found "
+        "in train_smiles.csv"
+    )
+
+
+y = (
+    train_df["label"]
+    .astype(int)
+    .values
+)
+
+
+unique_labels = np.unique(
+    y
+)
+
+
+if not np.array_equal(
+    unique_labels,
+    np.array([0, 1])
+):
+
+    raise ValueError(
+        f"Labels must be binary [0, 1], "
+        f"but found {unique_labels}"
+    )
+
+
+n_samples_csv = len(y)
+
+
+print(
+    f"Training samples : {n_samples_csv}"
+)
+
+print(
+    f"Positive samples : "
+    f"{np.sum(y == 1)}"
+)
+
+print(
+    f"Negative samples : "
+    f"{np.sum(y == 0)}"
+)
+
+
+# ============================================================
+# 8. CHECK SEQUENCE INFORMATION
+# ============================================================
+
+print(
+    "\n"
+    + "=" * 80
+)
+
+print(
+    "CHECKING SEQUENCE INFORMATION"
+)
+
+print(
+    "=" * 80
+)
+
+
+sequence_lengths_from_sequence = (
+    train_df["sequence"]
+    .astype(str)
+    .str.len()
+    .values
+)
+
+
+if "length" in train_df.columns:
+
+    csv_lengths = (
+        train_df["length"]
+        .astype(int)
+        .values
+    )
+
+    if not np.array_equal(
+        sequence_lengths_from_sequence,
+        csv_lengths
+    ):
+
+        raise ValueError(
+            "The 'length' column in train_smiles.csv "
+            "does not match the actual sequence lengths."
+        )
+
+    print(
+        "✅ CSV 'length' matches sequence lengths."
+    )
+
+else:
+
+    csv_lengths = (
+        sequence_lengths_from_sequence
+    )
+
+    print(
+        "ℹ️ No 'length' column found; "
+        "sequence lengths were calculated directly."
+    )
+
+
+print(
+    f"Minimum sequence length : "
+    f"{np.min(sequence_lengths_from_sequence)}"
+)
+
+print(
+    f"Maximum sequence length : "
+    f"{np.max(sequence_lengths_from_sequence)}"
+)
+
+print(
+    f"Mean sequence length    : "
+    f"{np.mean(sequence_lengths_from_sequence):.2f}"
+)
+
+
+# ============================================================
+# 9. LOAD COMPLEMENTARY FEATURE MATRICES
+# ============================================================
+
+print(
+    "\n"
+    + "=" * 80
+)
+
+print(
+    "LOADING COMPLEMENTARY FEATURES"
+)
+
+print(
+    "=" * 80
+)
+
+
+train_chemberta = load_array(
+    TRAIN_CHEMBERTA,
+    "Train ChemBERTa",
+    expected_ndim=2
+)
+
+
+train_prostt5 = load_array(
+    TRAIN_PROSTT5,
+    "Train ProstT5",
+    expected_ndim=2
+)
+
+
+train_handcrafted = load_array(
+    TRAIN_HANDCRAFTED,
+    "Train Handcrafted",
+    expected_ndim=2
+)
+
+
+# ============================================================
+# 10. LOAD ESM-2 QUERY REPRESENTATION
+# ============================================================
+
+print(
+    "\n"
+    + "=" * 80
+)
+
+print(
+    "LOADING ESM-2 QUERY REPRESENTATION"
+)
+
+print(
+    "=" * 80
+)
+
+
+train_esm2_tokens = load_array(
+    TRAIN_ESM2_TOKENS,
+    "Train ESM-2 tokens",
+    expected_ndim=3
+)
+
+
+train_esm2_lengths = load_array(
+    TRAIN_ESM2_LENGTHS,
+    "Train ESM-2 lengths",
+    expected_ndim=1
+)
+
+
+# ============================================================
+# 11. DYNAMIC DIMENSION EXTRACTION
+# ============================================================
+
+chemberta_dim = (
+    train_chemberta.shape[1]
+)
+
+prostt5_dim = (
+    train_prostt5.shape[1]
+)
+
+handcrafted_dim = (
+    train_handcrafted.shape[1]
+)
+
+esm2_sequence_length = (
+    train_esm2_tokens.shape[1]
+)
+
+esm2_embedding_dim = (
+    train_esm2_tokens.shape[2]
+)
+
+
+print(
+    "\n"
+    + "=" * 80
+)
+
+print(
+    "DYNAMICALLY DETECTED DIMENSIONS"
+)
+
+print(
+    "=" * 80
+)
+
+print(
+    f"ChemBERTa dimension       : "
+    f"{chemberta_dim}"
+)
+
+print(
+    f"ProstT5 dimension         : "
+    f"{prostt5_dim}"
+)
+
+print(
+    f"Handcrafted dimension     : "
+    f"{handcrafted_dim}"
+)
+
+print(
+    f"ESM-2 token sequence dim  : "
+    f"{esm2_sequence_length}"
+)
+
+print(
+    f"ESM-2 embedding dimension : "
+    f"{esm2_embedding_dim}"
+)
+
+
+# ============================================================
+# 12. FINITE-VALUE CHECKS
+# ============================================================
+
+print(
+    "\n"
+    + "=" * 80
+)
+
+print(
+    "CHECKING NaN / INF VALUES"
+)
+
+print(
+    "=" * 80
+)
+
+
+check_finite_2d(
+    train_chemberta,
+    "Train ChemBERTa"
+)
+
+print(
+    "✅ ChemBERTa finite-value check passed."
+)
+
+
+check_finite_2d(
+    train_prostt5,
+    "Train ProstT5"
+)
+
+print(
+    "✅ ProstT5 finite-value check passed."
+)
+
+
+check_finite_2d(
+    train_handcrafted,
+    "Train Handcrafted"
+)
+
+print(
+    "✅ Handcrafted finite-value check passed."
+)
+
+
+check_finite_3d_chunked(
+    train_esm2_tokens,
+    "Train ESM-2 tokens"
+)
+
+print(
+    "✅ ESM-2 token finite-value check passed."
+)
+
+
+if not np.isfinite(
+    train_esm2_lengths
+).all():
+
+    raise ValueError(
+        "ESM-2 lengths contain NaN or Inf."
+    )
+
+
+# ============================================================
+# 13. SAMPLE-COUNT VALIDATION
+# ============================================================
+
+print(
+    "\n"
+    + "=" * 80
+)
+
+print(
+    "SAMPLE-COUNT VALIDATION"
+)
+
+print(
+    "=" * 80
+)
+
+
+feature_sample_counts = {
+
+    "ChemBERTa":
+        train_chemberta,
+
+    "ProstT5":
+        train_prostt5,
+
+    "Handcrafted":
+        train_handcrafted,
+
+    "ESM-2":
+        train_esm2_tokens
+}
+
+
+n_samples_features = (
+    check_same_sample_count(
+        feature_sample_counts
+    )
+)
+
+
+if n_samples_features != n_samples_csv:
+
+    raise ValueError(
+        f"Feature rows ({n_samples_features}) "
+        f"do not match CSV labels ({n_samples_csv})."
+    )
+
+
+if train_esm2_lengths.shape[0] != n_samples_csv:
+
+    raise ValueError(
+        f"ESM-2 length count "
+        f"({train_esm2_lengths.shape[0]}) "
+        f"does not match training samples "
+        f"({n_samples_csv})."
+    )
+
+
+print(
+    "✅ All representations contain "
+    f"{n_samples_csv} samples."
+)
+
+
+# ============================================================
+# 14. ESM-2 LENGTH VALIDATION
+# ============================================================
+
+print(
+    "\n"
+    + "=" * 80
+)
+
+print(
+    "VALIDATING ESM-2 SEQUENCE LENGTHS"
+)
+
+print(
+    "=" * 80
+)
+
+
+esm2_lengths = np.asarray(
+    train_esm2_lengths
+).astype(int)
+
+
+if np.any(
+    esm2_lengths <= 0
+):
+
+    raise ValueError(
+        "ESM-2 lengths must be greater than zero."
+    )
+
+
+if np.any(
+    esm2_lengths > esm2_sequence_length
+):
+
+    raise ValueError(
+        "At least one ESM-2 sequence length "
+        "exceeds the stored token sequence dimension."
+    )
+
+
+if not np.array_equal(
+    esm2_lengths,
+    sequence_lengths_from_sequence
+):
+
+    mismatched = np.where(
+        esm2_lengths
+        !=
+        sequence_lengths_from_sequence
+    )[0]
+
+    example_indices = mismatched[:10]
+
+    raise ValueError(
+        "ESM-2 lengths do not match the "
+        "actual sequence lengths in train_smiles.csv.\n"
+        f"Number of mismatches: {len(mismatched)}\n"
+        f"Example indices: {example_indices.tolist()}"
+    )
+
+
+print(
+    "✅ ESM-2 lengths match the input sequences."
+)
+
+print(
+    f"Stored token length : {esm2_sequence_length}"
+)
+
+print(
+    f"Actual max length   : {np.max(esm2_lengths)}"
+)
+
+print(
+    f"Actual min length   : {np.min(esm2_lengths)}"
+)
+
+print(
+    f"Actual mean length  : {np.mean(esm2_lengths):.2f}"
+)
+
+
+# ============================================================
+# 15. BUILD COMPLEMENTARY FEATURE SPACE
+# ============================================================
+#
+# IMPORTANT:
+#
+# ESM-2 is NOT included here.
+#
+# ESM-2 is the sequence-aware Query pathway
+# of the final TLH-AFP architecture.
+#
+# Random Forest Feature Selection is applied only to:
+#
+#   ChemBERTa
+#   +
+#   ProstT5
+#   +
+#   Handcrafted
+#
+# ============================================================
+
+print(
+    "\n"
+    + "=" * 80
+)
+
+print(
+    "BUILDING COMPLEMENTARY FEATURE SPACE"
+)
+
+print(
+    "=" * 80
+)
+
+
+X = np.concatenate(
+    [
+        np.asarray(train_chemberta),
+        np.asarray(train_prostt5),
+        np.asarray(train_handcrafted)
+    ],
+    axis=1
+)
+
+
+TOTAL_FEATURES = (
+    X.shape[1]
+)
+
+
+print(
+    f"Combined X shape : {X.shape}"
+)
+
+print(
+    f"Total complementary features : "
+    f"{TOTAL_FEATURES}"
+)
+
+
+if TOTAL_FEATURES <= 0:
+
+    raise ValueError(
+        "No complementary features were found."
+    )
+
+
+# ============================================================
+# 16. DYNAMIC FEATURE RANGES
+# ============================================================
+
+feature_dimensions = {
+
+    "ChemBERTa":
+        chemberta_dim,
+
+    "ProstT5":
+        prostt5_dim,
+
+    "Handcrafted_488":
+        handcrafted_dim
+}
+
+
+feature_ranges = get_feature_ranges(
+    feature_dimensions
+)
+
+
+print(
+    "\nFeature ranges:"
+)
+
+
+for name, (
+    start,
+    end
+) in feature_ranges.items():
+
+    print(
+        f"  {name:<20} "
+        f"[{start}:{end}] "
+        f"-> {end - start} features"
+    )
+
+
+# ============================================================
+# 17. GLOBAL CONSISTENCY CHECK
+# ============================================================
+
+calculated_total = sum(
+    feature_dimensions.values()
+)
+
+
+if calculated_total != TOTAL_FEATURES:
+
+    raise ValueError(
+        "Dynamic feature dimension calculation "
+        "does not match concatenated feature matrix."
+    )
+
+
+# ============================================================
+# 18. STRATIFIED K-FOLD
+# ============================================================
+
+print(
+    "\n"
+    + "=" * 80
+)
+
+print(
+    "CREATING STRATIFIED 5-FOLD SPLITS"
+)
+
+print(
+    "=" * 80
+)
+
+
+sample_indices = np.arange(
+    n_samples_csv
+)
+
+
+skf = StratifiedKFold(
+
+    n_splits=N_SPLITS,
+
+    shuffle=True,
+
+    random_state=SEED
+)
+
+
+fold_splits = list(
+    skf.split(
+        sample_indices,
+        y
+    )
+)
+
+
+# ============================================================
+# 19. CONVERT SPLITS TO EXPLICIT DICTIONARIES
+# ============================================================
+
+cv_splits = [
+
+    {
+        "train_idx":
+            train_idx,
+
+        "val_idx":
+            val_idx
+    }
+
+    for train_idx, val_idx
+    in fold_splits
+]
+
+
+if len(cv_splits) != N_SPLITS:
+
+    raise RuntimeError(
+        "Unexpected number of CV folds."
+    )
+
+
+# ============================================================
+# 20. SAVE CV SPLITS
+# ============================================================
+
+splits_path = os.path.join(
+    CV_OUTPUT_DIR,
+    "cv_splits.pkl"
+)
+
+
+with open(
+    splits_path,
+    "wb"
+) as f:
+
+    pickle.dump(
+        cv_splits,
+        f
+    )
+
+
+print(
+    "✅ CV splits saved:"
+)
+
+print(
+    splits_path
+)
+
+print(
+    f"Number of folds: {len(cv_splits)}"
+)
+
+
+# ============================================================
+# 21. FOLD RESULT STORAGE
+# ============================================================
+
+fold_summary = []
+
+
+# ============================================================
+# 22. FOLD-BY-FOLD FEATURE SELECTION
+# ============================================================
+
+for fold_number, split in enumerate(
+    cv_splits,
+    start=1
+):
+
+    train_idx = split[
+        "train_idx"
+    ]
+
+    val_idx = split[
+        "val_idx"
+    ]
+
+
+    print(
+        "\n"
+        + "=" * 80
+    )
+
+    print(
+        f"FOLD {fold_number}/{N_SPLITS}"
+    )
+
+    print(
+        "=" * 80
+    )
+
+
+    # --------------------------------------------------------
+    # Fold-specific data
+    # --------------------------------------------------------
+
+    X_fold_train = (
+        X[train_idx]
+    )
+
+    y_fold_train = (
+        y[train_idx]
+    )
+
+    X_fold_val = (
+        X[val_idx]
+    )
+
+    y_fold_val = (
+        y[val_idx]
+    )
+
+
+    print(
+        f"Fold train samples : "
+        f"{len(train_idx)}"
+    )
+
+    print(
+        f"Fold validation samples : "
+        f"{len(val_idx)}"
+    )
+
+    print(
+        f"Train positive : "
+        f"{np.sum(y_fold_train == 1)}"
+    )
+
+    print(
+        f"Train negative : "
+        f"{np.sum(y_fold_train == 0)}"
+    )
+
+    print(
+        f"Val positive   : "
+        f"{np.sum(y_fold_val == 1)}"
+    )
+
+    print(
+        f"Val negative   : "
+        f"{np.sum(y_fold_val == 0)}"
+    )
+
+
+    # --------------------------------------------------------
+    # Fold output directory
+    # --------------------------------------------------------
+
+    fold_dir = os.path.join(
+
+        CV_OUTPUT_DIR,
+
+        f"fold_{fold_number}"
+    )
+
+
+    os.makedirs(
+        fold_dir,
+        exist_ok=True
+    )
+
+
+    # ========================================================
+    # 23. STANDARD SCALING
+    # ========================================================
+    #
+    # IMPORTANT:
+    # Fit only on fold training data.
+    #
+    # Validation is transformed using the training-fitted scaler.
+    #
+    # ========================================================
+
+    print(
+        "\n📏 Fitting StandardScaler "
+        "on fold training data..."
+    )
+
+
+    scaler = StandardScaler()
+
+
+    X_fold_train_scaled = (
+        scaler.fit_transform(
+            X_fold_train
+        )
+    )
+
+
+    X_fold_val_scaled = (
+        scaler.transform(
+            X_fold_val
+        )
+    )
+
+
+    print(
+        "✅ Fold scaling completed."
+    )
+
+
+    # ========================================================
+    # 24. RANDOM FOREST
+    # ========================================================
+    #
+    # Method:
+    #
+    #   Random Forest
+    #   100 estimators
+    #   feature importance
+    #   threshold = mean importance
+    #
+    # RF is fitted ONLY on fold-training data.
+    #
+    # ========================================================
+
+    print(
+        "\n🌲 Training Random Forest..."
+    )
+
+
+    rf = RandomForestClassifier(
+
+        n_estimators=RF_N_ESTIMATORS,
+
+        random_state=RF_RANDOM_STATE,
+
+        n_jobs=-1
+    )
+
+
+    rf.fit(
+        X_fold_train_scaled,
+        y_fold_train
+    )
+
+
+    print(
+        "✅ Random Forest training completed."
+    )
+
+    print(
+        f"Trees : {rf.n_estimators}"
+    )
+
+
+    # ========================================================
+    # 25. FEATURE IMPORTANCE
+    # ========================================================
+
+    importances = (
+        rf.feature_importances_
+    )
+
+
+    if len(importances) != TOTAL_FEATURES:
+
+        raise RuntimeError(
+            "Random Forest importance vector "
+            "does not match total feature count."
+        )
+
+
+    mean_importance = float(
+        np.mean(
+            importances
+        )
+    )
+
+
+    print(
+        "\n📊 Feature importance statistics:"
+    )
+
+    print(
+        f"Number of features : "
+        f"{len(importances)}"
+    )
+
+    print(
+        f"Mean importance    : "
+        f"{mean_importance:.12f}"
+    )
+
+    print(
+        f"Maximum importance : "
+        f"{np.max(importances):.12f}"
+    )
+
+    print(
+        f"Minimum importance : "
+        f"{np.min(importances):.12f}"
+    )
+
+
+    # ========================================================
+    # 26. SELECT FEATURES
+    # ========================================================
+    #
+    # Same paper-style threshold:
+    #
+    #   threshold = mean
+    #
+    # No number of selected features is specified beforehand.
+    #
+    # ========================================================
+
+    selector = SelectFromModel(
+
+        estimator=rf,
+
+        threshold="mean",
+
+        prefit=True
+    )
+
+
+    selected_mask = (
+        selector.get_support()
+    )
+
+
+    n_selected = int(
+        np.sum(
+            selected_mask
+        )
+    )
+
+
+    if n_selected <= 0:
+
+        raise RuntimeError(
+            f"Fold {fold_number}: "
+            "Feature selection removed all features."
+        )
+
+
+    print(
+        "\n"
+        + "-" * 80
+    )
+
+    print(
+        f"FEATURE SELECTION RESULT - FOLD {fold_number}"
+    )
+
+    print(
+        "-" * 80
+    )
+
+    print(
+        f"Total features    : "
+        f"{TOTAL_FEATURES}"
+    )
+
+    print(
+        f"Selected features : "
+        f"{n_selected}"
+    )
+
+    print(
+        f"Removed features  : "
+        f"{TOTAL_FEATURES - n_selected}"
+    )
+
+    print(
+        f"Selection ratio   : "
+        f"{100.0 * n_selected / TOTAL_FEATURES:.2f}%"
+    )
+
+
+    # ========================================================
+    # 27. APPLY SELECTOR
+    # ========================================================
+
+    X_fold_train_selected = (
+        selector.transform(
+            X_fold_train_scaled
+        )
+    )
+
+
+    X_fold_val_selected = (
+        selector.transform(
+            X_fold_val_scaled
+        )
+    )
+
+
+    print(
+        "\nSelected matrix shapes:"
+    )
+
+    print(
+        f"Fold train selected : "
+        f"{X_fold_train_selected.shape}"
+    )
+
+    print(
+        f"Fold val selected   : "
+        f"{X_fold_val_selected.shape}"
+    )
+
+
+    # ========================================================
+    # 28. SELECTED FEATURES PER MODALITY
+    # ========================================================
+
+    selected_feature_counts = (
+        get_selected_feature_counts(
+            selected_mask,
+            feature_ranges
+        )
+    )
+
+
+    print(
+        "\nSelected features per representation:"
+    )
+
+
+    for name, count in (
+        selected_feature_counts.items()
+    ):
+
+        total_for_representation = (
+            feature_dimensions[name]
+        )
+
+        print(
+            f"  {name:<20}: "
+            f"{count} / "
+            f"{total_for_representation}"
+        )
+
+
+    # ========================================================
+    # 29. TOP 20 FEATURES
+    # ========================================================
+
+    sorted_feature_indices = np.argsort(
+        importances
+    )[::-1]
+
+
+    print(
+        "\nTop 20 features:"
+    )
+
+
+    for rank, feature_index in enumerate(
+        sorted_feature_indices[:20],
+        start=1
+    ):
+
+        representation_name, local_index = (
+            feature_index_to_representation(
+                feature_index,
+                feature_ranges
+            )
+        )
+
+
+        print(
+            f"{rank:>2}. "
+            f"Global={feature_index:<5} | "
+            f"{representation_name:<18} "
+            f"local={local_index:<5} | "
+            f"importance="
+            f"{importances[feature_index]:.10f}"
+        )
+
+
+    # ========================================================
+    # 30. SAVE SELECTED MATRICES
+    # ========================================================
+
+    train_selected_path = os.path.join(
+
+        fold_dir,
+
+        "train_selected.npy"
+    )
+
+
+    val_selected_path = os.path.join(
+
+        fold_dir,
+
+        "val_selected.npy"
+    )
+
+
+    np.save(
+
+        train_selected_path,
+
+        X_fold_train_selected
+    )
+
+
+    np.save(
+
+        val_selected_path,
+
+        X_fold_val_selected
+    )
+
+
+    # ========================================================
+    # 31. SAVE FOLD INDICES
+    # ========================================================
+
+    fold_indices_path = os.path.join(
+
+        fold_dir,
+
+        "fold_indices.npz"
+    )
+
+
+    np.savez(
+
+        fold_indices_path,
+
+        train_idx=train_idx,
+
+        val_idx=val_idx
+    )
+
+
+    # ========================================================
+    # 32. SAVE FEATURE-SELECTION ARTIFACT
+    # ========================================================
+
+    artifact = {
+
+        "method":
+            "Random Forest Feature Selection",
+
+        "paper_method":
+            "AFP-MVFL",
+
+        "selection_rule":
+            "features with importance "
+            "greater than or equal to mean importance",
+
+        "cv":
+            True,
+
+        "fold":
+            fold_number,
+
+        "n_splits":
+            N_SPLITS,
+
+        "cv_random_state":
+            SEED,
+
+        "rf_n_estimators":
+            RF_N_ESTIMATORS,
+
+        "rf_random_state":
+            RF_RANDOM_STATE,
+
+        "scaler":
+            scaler,
+
+        "random_forest":
+            rf,
+
+        "selector":
+            selector,
+
+        "selected_mask":
+            selected_mask,
+
+        "feature_importances":
+            importances,
+
+        "mean_importance":
+            mean_importance,
+
+        "threshold":
+            "mean",
+
+        "total_features":
+            TOTAL_FEATURES,
+
+        "selected_features":
+            n_selected,
+
+        "representations":
+            list(
+                feature_dimensions.keys()
+            ),
+
+        "representation_dimensions":
+            feature_dimensions,
+
+        "feature_ranges":
+            feature_ranges,
+
+        "selected_feature_counts":
+            selected_feature_counts,
+
+        # ----------------------------------------------------
+        # ESM-2 is NOT feature-selected
+        # ----------------------------------------------------
+
+        "query_embedding_model":
+            ESM2_MODEL_NAME,
+
+        "query_embedding_dimension":
+            int(
+                esm2_embedding_dim
+            ),
+
+        "query_sequence_length_dimension":
+            int(
+                esm2_sequence_length
+            ),
+
+        "query_actual_min_length":
+            int(
+                np.min(esm2_lengths)
+            ),
+
+        "query_actual_max_length":
+            int(
+                np.max(esm2_lengths)
+            ),
+
+        "query_actual_mean_length":
+            float(
+                np.mean(esm2_lengths)
+            ),
+
+        "query_feature_selection":
+            False,
+
+        "query_is_sequence_aware":
+            True,
+
+        "complementary_feature_selection":
+            True,
+
+        "train_samples":
+            len(train_idx),
+
+        "validation_samples":
+            len(val_idx),
+
+        "train_indices":
+            train_idx,
+
+        "validation_indices":
+            val_idx,
+
+        "train_selected_file":
+            "train_selected.npy",
+
+        "validation_selected_file":
+            "val_selected.npy",
+
+        "fold_indices_file":
+            "fold_indices.npz"
+    }
+
+
+    selector_path = os.path.join(
+
+        fold_dir,
+
+        "feature_selector_rf.pkl"
+    )
+
+
+    with open(
+        selector_path,
+        "wb"
+    ) as f:
+
+        pickle.dump(
+            artifact,
+            f
+        )
+
+
+    # ========================================================
+    # 33. SAVE SELECTED FEATURE MASK
+    # ========================================================
+
+    mask_path = os.path.join(
+
+        fold_dir,
+
+        "selected_feature_mask.npy"
+    )
+
+
+    np.save(
+
+        mask_path,
+
+        selected_mask
+    )
+
+
+    # ========================================================
+    # 34. SAVE FOLD IMPORTANCE TABLE
+    # ========================================================
+
+    importance_records = []
+
+
+    for feature_index in range(
+        TOTAL_FEATURES
+    ):
+
+        representation_name, local_index = (
+            feature_index_to_representation(
+                feature_index,
+                feature_ranges
+            )
+        )
+
+
+        importance_records.append({
+
+            "global_feature_index":
+                feature_index,
+
+            "representation":
+                representation_name,
+
+            "local_feature_index":
+                local_index,
+
+            "importance":
+                float(
+                    importances[
+                        feature_index
+                    ]
+                ),
+
+            "selected":
+                bool(
+                    selected_mask[
+                        feature_index
+                    ]
+                )
+        })
+
+
+    importance_df = pd.DataFrame(
+        importance_records
+    )
+
+
+    importance_path = os.path.join(
+
+        fold_dir,
+
+        "feature_importance.csv"
+    )
+
+
+    importance_df.to_csv(
+        importance_path,
+        index=False
+    )
+
+
+    # ========================================================
+    # 35. PRINT SAVED ARTIFACTS
+    # ========================================================
+
+    print(
+        "\n💾 Fold artifacts saved:"
+    )
+
+    print(
+        f"  Selector          : "
+        f"{selector_path}"
+    )
+
+    print(
+        f"  Selected mask     : "
+        f"{mask_path}"
+    )
+
+    print(
+        f"  Train selected    : "
+        f"{train_selected_path}"
+    )
+
+    print(
+        f"  Validation selected: "
+        f"{val_selected_path}"
+    )
+
+    print(
+        f"  Fold indices      : "
+        f"{fold_indices_path}"
+    )
+
+    print(
+        f"  Importance table  : "
+        f"{importance_path}"
+    )
+
+
+    # ========================================================
+    # 36. FOLD SUMMARY
+    # ========================================================
+
+    fold_summary.append({
+
+        "Fold":
+            fold_number,
+
+        "Train_Samples":
+            len(train_idx),
+
+        "Validation_Samples":
+            len(val_idx),
+
+        "Total_Features":
+            TOTAL_FEATURES,
+
+        "Selected_Features":
+            n_selected,
+
+        "Removed_Features":
+            TOTAL_FEATURES - n_selected,
+
+        "Selection_Ratio":
+            (
+                100.0
+                *
+                n_selected
+                /
+                TOTAL_FEATURES
+            ),
+
+        "ChemBERTa_Total":
+            feature_dimensions[
+                "ChemBERTa"
+            ],
+
+        "ChemBERTa_Selected":
+            selected_feature_counts[
+                "ChemBERTa"
+            ],
+
+        "ProstT5_Total":
+            feature_dimensions[
+                "ProstT5"
+            ],
+
+        "ProstT5_Selected":
+            selected_feature_counts[
+                "ProstT5"
+            ],
+
+        "Handcrafted_Total":
+            feature_dimensions[
+                "Handcrafted_488"
+            ],
+
+        "Handcrafted_Selected":
+            selected_feature_counts[
+                "Handcrafted_488"
+            ],
+
+        "RF_Estimators":
+            RF_N_ESTIMATORS,
+
+        "RF_Random_State":
+            RF_RANDOM_STATE,
+
+        "Mean_Importance":
+            mean_importance,
+
+        "ESM2_Query_Dimension":
+            esm2_embedding_dim,
+
+        "ESM2_Query_Max_Sequence_Length":
+            esm2_sequence_length,
+
+        "ESM2_Query_Feature_Selection":
+            False
+    })
+
+
+# ============================================================
+# 37. SAVE CV SUMMARY
+# ============================================================
+
+summary_path = os.path.join(
+
+    CV_OUTPUT_DIR,
+
+    "feature_selection_cv_summary.csv"
+)
+
+
+summary_df = pd.DataFrame(
+    fold_summary
+)
+
+
+summary_df.to_csv(
+    summary_path,
+    index=False
+)
+
+
+# ============================================================
+# 38. SAVE GLOBAL PROTOCOL METADATA
+# ============================================================
+
+protocol_metadata = {
+
+    "experiment":
+        "TLH-AFP",
+
+    "feature_selection_method":
+        "Random Forest Feature Selection",
+
+    "paper_method":
+        "AFP-MVFL",
+
+    "cv_method":
+        "StratifiedKFold",
+
+    "n_splits":
+        N_SPLITS,
+
+    "cv_random_state":
+        SEED,
+
+    "rf_n_estimators":
+        RF_N_ESTIMATORS,
+
+    "rf_random_state":
+        RF_RANDOM_STATE,
+
+    "feature_selection_threshold":
+        "mean",
+
+    "complementary_representations":
+        list(
+            feature_dimensions.keys()
+        ),
+
+    "complementary_feature_dimensions":
+        feature_dimensions,
+
+    "complementary_total_features":
+        TOTAL_FEATURES,
+
+    "query_embedding_model":
+        ESM2_MODEL_NAME,
+
+    "query_embedding_dimension":
+        int(
+            esm2_embedding_dim
+        ),
+
+    "query_sequence_length_dimension":
+        int(
+            esm2_sequence_length
+        ),
+
+    "query_actual_min_length":
+        int(
+            np.min(esm2_lengths)
+        ),
+
+    "query_actual_max_length":
+        int(
+            np.max(esm2_lengths)
+        ),
+
+    "query_actual_mean_length":
+        float(
+            np.mean(esm2_lengths)
+        ),
+
+    "query_feature_selection":
+        False,
+
+    "query_is_sequence_aware":
+        True,
+
+    "test_data_loaded":
+        False,
+
+    "test_data_used_for_scaling":
+        False,
+
+    "test_data_used_for_rf":
+        False,
+
+    "test_data_used_for_feature_selection":
+        False
+}
+
+
+protocol_path = os.path.join(
+
+    CV_OUTPUT_DIR,
+
+    "feature_selection_protocol.pkl"
+)
+
+
+with open(
+    protocol_path,
+    "wb"
+) as f:
+
+    pickle.dump(
+        protocol_metadata,
+        f
+    )
+
+
+# ============================================================
+# 39. FINAL SUMMARY
+# ============================================================
+
+print(
+    "\n"
+    + "=" * 80
+)
+
+print(
+    "✅ 5-FOLD FEATURE SELECTION COMPLETED"
+)
+
+print(
+    "=" * 80
+)
+
+
+print(
+    "\nFold summary:"
+)
+
+
+for row in fold_summary:
+
+    print(
+
+        f"Fold {row['Fold']}: "
+        f"{row['Selected_Features']} / "
+        f"{row['Total_Features']} "
+        f"("
+        f"{row['Selection_Ratio']:.2f}%"
+        ") | "
+        f"ChemBERTa="
+        f"{row['ChemBERTa_Selected']} | "
+        f"ProstT5="
+        f"{row['ProstT5_Selected']} | "
+        f"Handcrafted="
+        f"{row['Handcrafted_Selected']}"
+    )
+
+
+print(
+    "\n📊 Summary saved:"
+)
+
+print(
+    summary_path
+)
+
+
+print(
+    "\n📋 Protocol metadata saved:"
+)
+
+print(
+    protocol_path
+)
+
+
+print(
+    "\n🔒 TEST DATA"
+)
+
+print(
+    "Test data were NOT loaded."
+)
+
+print(
+    "Test data were NOT used for scaling."
+)
+
+print(
+    "Test data were NOT used for Random Forest fitting."
+)
+
+print(
+    "Test data were NOT used for feature selection."
+)
+
+
+print(
+    "\n🧬 ESM-2 QUERY PATH"
+)
+
+print(
+    f"Model      : {ESM2_MODEL_NAME}"
+)
+
+print(
+    f"Embedding  : {esm2_embedding_dim} dimensions"
+)
+
+print(
+    f"Token axis  : {esm2_sequence_length}"
+)
+
+print(
+    f"Max length : {np.max(esm2_lengths)}"
+)
+
+print(
+    "Feature Selection on ESM-2: NO"
+)
+
+print(
+    "ESM-2 is reserved for the sequence-aware Query pathway."
+)
+
+
+print(
+    "\n📌 EACH FOLD CONTAINS:"
+)
+
+print(
+    "   - fold-specific StandardScaler"
+)
+
+print(
+    "   - fold-specific Random Forest"
+)
+
+print(
+    "   - fold-specific feature selector"
+)
+
+print(
+    "   - selected train matrix"
+)
+
+print(
+    "   - selected validation matrix"
+)
+
+print(
+    "   - fold indices"
+)
+
+print(
+    "   - selected-feature mask"
+)
+
+print(
+    "   - complete feature-importance table"
+)
+
+
+print(
+    "\n➡️ These artifacts are ready for "
+    "the next fold-specific Pre-training/Training stage."
+)
+
+
+print(
+    "=" * 80
+)
