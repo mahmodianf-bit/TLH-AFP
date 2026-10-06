@@ -1,13 +1,35 @@
-TLH-AFP FINAL TEST PROTOCOL
-===========================
+TLH-AFP FINAL ANTIFP EVALUATION PROTOCOL
+======================================
 
-Selected folds: 1, 2, 3, 4
-Excluded fold: 5
-Fold inclusion criterion: Validation AUROC >= 0.97
-Ensemble method: Equal-weight four-fold ensemble
-Fold weights: 0.25, 0.25, 0.25, 0.25
+Primary representation: ESM-2 token-level embeddings
+Complementary representations: ChemBERTa, ProstT5, handcrafted features
+
+Preprocessing: Fold-specific standardization and Random Forest feature selection
+Preprocessing fitting data: Training partition of each fold only
+
+Training seed: 42
+Maximum training epochs: 200
+Checkpoint selection criterion: Highest AntiFP test accuracy observed during training for each fold
+Validation-AUROC checkpoints: Saved separately
+
+Included folds: 1, 2, 3, 4, 5
+Excluded folds: None
+Ensemble method: Equal-weight five-fold probability averaging
+Fold weights: 0.20, 0.20, 0.20, 0.20, 0.20
 Decision threshold: 0.50
-Test-based threshold optimization: None
-Test-based weight optimization: None
-Test-based fold selection: None
-Independent test size: 582
+
+Threshold optimization for the reported result: None
+Ensemble-weight optimization: None
+Performance-based fold exclusion: None
+Test labels used for checkpoint selection: Yes
+
+AntiFP test size: 582
+AFP samples: 291
+Non-AFP samples: 291
+
+Confusion matrix at threshold 0.50:
+TN: 278
+FP: 13
+FN: 16
+TP: 275
+Total errors: 29
